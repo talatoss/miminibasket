@@ -1,0 +1,7 @@
+{
+  "name": "miminibasket",
+  "private": true,
+  "type": "module",
+  "scripts": { "actualizar": "node scraper/actualizar.mjs" },
+  "engines": { "node": ">=20" }
+}

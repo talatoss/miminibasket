@@ -1,0 +1,45 @@
+name: Actualizar datos y publicar
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Cada 8 horas los sábados, domingos, lunes y martes (06:23, 14:23 y 22:23 UTC;
+    # en Álava 07:23, 15:23 y 23:23 en invierno; una hora más en verano)
+    - cron: '23 6,14,22 * * 6,0,1,2'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  construir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Leer basketaraba.com y generar los datos
+        run: node scraper/actualizar.mjs dist
+      - name: Añadir la app
+        run: cp -r app/. dist/ && touch dist/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  publicar:
+    needs: construir
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.despliegue.outputs.page_url }}
+    steps:
+      - id: despliegue
+        uses: actions/deploy-pages@v4
