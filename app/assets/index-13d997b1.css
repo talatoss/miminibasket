@@ -3,3 +3,5 @@
 /* Acceso directo en iPhone: respetar la barra de estado y la zona inferior */
 .app-header{padding-top:calc(12px + env(safe-area-inset-top));padding-left:calc(20px + env(safe-area-inset-left));padding-right:calc(20px + env(safe-area-inset-right))}
 .app-container{padding-bottom:calc(80px + env(safe-area-inset-bottom))}
+/* iOS en modo acceso directo difumina el texto con degradado bajo backdrop-filter: usar color sólido */
+.brand-text h1{background:none;-webkit-background-clip:border-box;-webkit-text-fill-color:#fff;color:#fff}
