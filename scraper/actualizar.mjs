@@ -12,6 +12,7 @@ const SALIDA = path.resolve(process.argv[2] || path.join(RAIZ, 'dist'));
 const API = path.join(SALIDA, 'api', 'v1');
 const BASE = 'https://basketaraba.com/es/fab-online/';
 const URL_CAL = g => `${BASE}calendario-y-resultados-federacion-alavesa-de-baloncesto?grupo=${g}`;
+const URL_PROX = `${BASE}proxima-jornada-federacion-alavesa-baloncesto`;
 const URL_CLA = g => `${BASE}clasificaciones-federacion-alavesa-de-baloncesto?grupo=${g}`;
 // Sitio ya publicado: se usa para no repetir consultas cuando nada ha cambiado y para el registro de cambios.
 const SITIO = (process.env.SITIO_URL || 'https://talatoss.github.io/miminibasket').replace(/\/$/, '');
@@ -77,6 +78,28 @@ function leerListaGrupos(html) {
   if (!t) throw new Error('No encuentro la lista de grupos (¿ha cambiado la web?)');
   return filas(t).map(f => { const [codigo, nombre, categoria] = celdas(f); return { codigo, nombre, categoria }; })
     .filter(g => /^\d{4}$/.test(g.codigo));
+}
+
+// "Próxima jornada": todos los grupos en una página; título "CODIGO nombre - categoría" + tabla por grupo.
+function leerProximaJornada(html) {
+  const porGrupo = new Map();
+  const bloques = html.split(/<p class=['"]tit-equipo['"]>/).slice(1);
+  for (const b of bloques) {
+    const titulo = texto(b.slice(0, b.indexOf('</p>')));
+    const codigo = titulo.match(/^(\d{4})\b/)?.[1];
+    const t = tablas(b)[0];
+    if (!codigo || !t) continue;
+    const cab = cabecera(t).map(norm);
+    const col = n => cab.indexOf(n);
+    if (col('HORA') < 0 || col('EQUIPO LOCAL') < 0) continue;
+    porGrupo.set(codigo, filas(t).map(f => {
+      const c = celdas(f);
+      const md = (c[col('FECHA')] || '').match(/(\d{2})-(\d{2})-(\d{4})/);
+      return { local: c[col('EQUIPO LOCAL')], visitante: c[col('EQUIPO VISITANTE')], fecha: md ? `${md[3]}-${md[2]}-${md[1]}` : '',
+               hora: c[col('HORA')] || '', campo: c[col('CAMPO')] || '', direccion: c[col('DIRECCIÓN')] || '', localidad: c[col('LOCALIDAD')] || '' };
+    }));
+  }
+  return porGrupo;
 }
 
 function leerTituloGrupo(html, codigo) {
@@ -156,9 +179,16 @@ console.log(`${lista.length} grupos a leer`);
 const cambiosPrevios = await anterior('cambios.json');
 const primeraVez = !cambiosPrevios;
 const registro = cambiosPrevios?.cambios ?? [];
-const nuevos = [];
-const resultado = { categorias: new Map(), equipos: [] };
 const errores = [];
+const nuevos = [];
+const registroHorarios = cambiosPrevios?.horarios ?? [];
+const horariosNuevos = [];
+let proxima = new Map();
+try {
+  proxima = leerProximaJornada(await obtener(URL_PROX, 'proxima-jornada.html'));
+  console.log(`Próxima jornada: ${proxima.size} grupos con horario publicado`);
+} catch (e) { errores.push(`próxima jornada: ${e.message}`); }
+const resultado = { categorias: new Map(), equipos: [] };
 let clasificacionesPedidas = 0;
 const firma = jornadas => JSON.stringify(jornadas.map(j => j.partidos.map(p => [p.localNombre, p.visitanteNombre, p.puntosLocal, p.puntosVisitante, p.estado])));
 
@@ -196,6 +226,29 @@ for (const g of lista) {
     // 2) Comparar con lo publicado: resultados nuevos y si hace falta pedir la clasificación
     const partidosAntes = await anterior(`grupos/${codigo}/partidos.json`);
     const claAntes = partidosAntes ? await anterior(`grupos/${codigo}/clasificacion.json`) : null;
+
+    // 2b) Horario y campo: de "Próxima jornada", o conservados de la versión publicada
+    const previoPorId = new Map((partidosAntes ?? []).flatMap(j => j.partidos).map(p => [p.id, p]));
+    const todos = partidos.flatMap(j => j.partidos.map(p => ({ p, fechaJornada: j.fecha })));
+    const dias = (a, b) => Math.abs((new Date(a) - new Date(b)) / 864e5);
+    for (const h of proxima.get(codigo) ?? []) {
+      const cands = todos.filter(x => norm(x.p.localNombre) === norm(h.local) && norm(x.p.visitanteNombre) === norm(h.visitante));
+      const elegido = cands.sort((a, b) => dias(a.fechaJornada, h.fecha) - dias(b.fechaJornada, h.fecha))[0];
+      if (!elegido) continue;
+      const fuera = h.localidad && norm(h.localidad) !== 'VITORIA' ? ` · ${h.localidad}` : '';
+      Object.assign(elegido.p, { fecha: h.fecha || elegido.p.fecha, hora: h.hora, campo: h.campo, campoNombre: (h.campo || '') + fuera || null,
+                                 direccion: h.direccion, localidad: h.localidad, horarioPublicado: true });
+    }
+    for (const { p } of todos) {
+      const a = previoPorId.get(p.id);
+      if (!p.horarioPublicado && a?.horarioPublicado) {
+        for (const k of ['fecha', 'hora', 'campo', 'campoNombre', 'direccion', 'localidad', 'horarioPublicado']) p[k] = a[k];
+      } else if (p.horarioPublicado && partidosAntes && !primeraVez &&
+                 (!a?.horarioPublicado || a.hora !== p.hora || a.campo !== p.campo || a.fecha !== p.fecha)) {
+        horariosNuevos.push({ detectado: ahora.toISOString(), grupo: codigo, partido: `${p.localNombre} - ${p.visitanteNombre}`,
+                              fecha: p.fecha, hora: p.hora, campo: p.campoNombre, cambio: !!a?.horarioPublicado });
+      }
+    }
     if (partidosAntes && !primeraVez) {
       const antes = new Map(partidosAntes.flatMap(j => j.partidos).map(p => [p.id, p]));
       for (const j of partidos) for (const p of j.partidos) {
@@ -251,12 +304,13 @@ for (const c of categorias) {
 }
 await escribir('equipos.json', { equipos: resultado.equipos });
 // Registro de cuándo aparece cada resultado nuevo (para conocer el ritmo de la federación)
-const ejecuciones = [...(cambiosPrevios?.ejecuciones ?? []), { fecha: ahora.toISOString(), resultadosNuevos: nuevos.length, clasificacionesPedidas }].slice(-200);
-await escribir('cambios.json', { cambios: [...registro, ...nuevos].slice(-2000), ejecuciones });
-await escribir('estado.json', { actualizado: ahora.toISOString(), grupos: lista.length, clasificacionesPedidas, resultadosNuevos: nuevos.length, errores });
-console.log(`\nListo: ${lista.length} grupos, ${clasificacionesPedidas} clasificaciones consultadas, ${nuevos.length} resultados nuevos${primeraVez ? ' (primera ejecución: sin comparar)' : ''}, ${errores.length} errores.`);
+const ejecuciones = [...(cambiosPrevios?.ejecuciones ?? []), { fecha: ahora.toISOString(), resultadosNuevos: nuevos.length, horariosNuevos: horariosNuevos.length, gruposConHorario: proxima.size, clasificacionesPedidas }].slice(-200);
+await escribir('cambios.json', { cambios: [...registro, ...nuevos].slice(-2000), horarios: [...registroHorarios, ...horariosNuevos].slice(-3000), ejecuciones });
+await escribir('estado.json', { actualizado: ahora.toISOString(), grupos: lista.length, clasificacionesPedidas, resultadosNuevos: nuevos.length, horariosNuevos: horariosNuevos.length, errores });
+console.log(`\nListo: ${lista.length} grupos, ${clasificacionesPedidas} clasificaciones consultadas, ${nuevos.length} resultados nuevos, ${horariosNuevos.length} horarios nuevos${primeraVez ? ' (primera ejecución: sin comparar)' : ''}, ${errores.length} errores.`);
 if (nuevos.length) console.log(`::notice::${nuevos.length} resultados nuevos en: ${[...new Set(nuevos.map(n => n.grupo))].join(', ')}`);
 else console.log('::notice::Sin resultados nuevos');
+console.log(`::notice::Horarios: ${proxima.size} grupos en próxima jornada, ${horariosNuevos.length} horarios nuevos o cambiados`);
 // Un grupo fallido no bloquea la publicación del resto; se avisa en GitHub Actions.
 for (const e of errores) console.log(`::warning::${e}`);
 
