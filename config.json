@@ -1,1 +1,1 @@
-{ "grupos": ["2003", "1402"] }
+{ "grupos": "todos", "excluirCategorias": ["^BENJAMIN"] }

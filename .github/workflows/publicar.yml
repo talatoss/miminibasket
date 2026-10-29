@@ -5,9 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    # Cada 8 horas los sábados, domingos, lunes y martes (06:23, 14:23 y 22:23 UTC;
-    # en Álava 07:23, 15:23 y 23:23 en invierno; una hora más en verano)
-    - cron: '23 6,14,22 * * 6,0,1,2'
+    # FASE DE MEDICIÓN (1-2 fines de semana): ver a qué horas publica la federación los resultados.
+    # Horas en UTC; en Álava +1 en invierno (+2 en verano).
+    - cron: '13 7-23/2 * * 6,0'    # sábado y domingo: cada 2 horas (08:13 a 00:13 en invierno)
+    - cron: '13 7-22/3 * * 1'      # lunes: cada 3 horas
 
 permissions:
   contents: read

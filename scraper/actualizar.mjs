@@ -1,7 +1,8 @@
 // Lector de basketaraba.com (Federación Alavesa de Baloncesto) para MiniBasket Álava.
 // Genera los JSON estáticos que la app espera en api/v1/ dentro de la carpeta de salida.
 // Uso: node scraper/actualizar.mjs [carpetaSalida]     (por defecto: dist)
-// Pruebas sin red: MUESTRAS=carpeta  -> lee calendario-<g>.html y clasificaciones-<g>.html de ahí.
+// Pruebas sin red: MUESTRAS=carpeta  -> lee calendario-<g>.html y clasificaciones-<g>.html de ahí
+// (y calendario-0.html para la lista de grupos). SIN_ANTERIOR=1 ignora la versión publicada.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,8 @@ const API = path.join(SALIDA, 'api', 'v1');
 const BASE = 'https://basketaraba.com/es/fab-online/';
 const URL_CAL = g => `${BASE}calendario-y-resultados-federacion-alavesa-de-baloncesto?grupo=${g}`;
 const URL_CLA = g => `${BASE}clasificaciones-federacion-alavesa-de-baloncesto?grupo=${g}`;
+// Sitio ya publicado: se usa para no repetir consultas cuando nada ha cambiado y para el registro de cambios.
+const SITIO = (process.env.SITIO_URL || 'https://talatoss.github.io/miminibasket').replace(/\/$/, '');
 const PAUSA_MS = 1500;
 const MUESTRAS = process.env.MUESTRAS;
 
@@ -60,7 +63,22 @@ async function obtener(url, muestra) {
   }
 }
 
+async function anterior(rel) {
+  if (process.env.SIN_ANTERIOR || (MUESTRAS && !process.env.SITIO_URL)) return null;
+  try {
+    const r = await fetch(`${SITIO}/api/v1/${rel}`, { cache: 'no-store' });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
 // ---------- lectores ----------
+function leerListaGrupos(html) {
+  const t = tablas(html).find(t => cabecera(t).map(norm).includes('CÓDIGO'));
+  if (!t) throw new Error('No encuentro la lista de grupos (¿ha cambiado la web?)');
+  return filas(t).map(f => { const [codigo, nombre, categoria] = celdas(f); return { codigo, nombre, categoria }; })
+    .filter(g => /^\d{4}$/.test(g.codigo));
+}
+
 function leerTituloGrupo(html, codigo) {
   const m = html.match(/<p class=['"]tit-equipo['"]>(.*?)<\/p>/s);
   const t = m ? texto(m[1]) : '';
@@ -117,24 +135,42 @@ function leerClasificacion(html, codigo) {
 const catsSemilla = semilla.categorias;
 const infoGrupoSemilla = {};
 for (const c of catsSemilla) for (const g of c.grupos) infoGrupoSemilla[g.codigo] = { ...g, categoria: c };
-
+const catSemillaPorNombre = Object.fromEntries(catsSemilla.map(c => [norm(c.nombre), c]));
+const generoDe = nombre => /MIX/i.test(nombre) ? 'MIXTO' : /FEM/i.test(nombre) ? 'F' : 'M';
 const idEquipo = (grupo, nombre) => semilla.equipos[`${grupo}|${norm(nombre)}`] ?? hashId(`eq|${grupo}|${norm(nombre)}`);
 
 const ahora = new Date();
 const anio = ahora.getMonth() >= 7 ? ahora.getFullYear() : ahora.getFullYear() - 1;
 const temporada = { id: 1, nombre: `${anio}-${anio + 1}`, anioInicio: anio };
 
+// 1) Qué grupos leer
+let lista;
+if (config.grupos === 'todos') {
+  const excluir = (config.excluirCategorias || []).map(x => new RegExp(x, 'i'));
+  lista = leerListaGrupos(await obtener(URL_CAL(0), 'calendario-0.html')).filter(g => !excluir.some(rx => rx.test(g.categoria)));
+} else {
+  lista = config.grupos.map(codigo => ({ codigo }));
+}
+console.log(`${lista.length} grupos a leer`);
+
+const cambiosPrevios = await anterior('cambios.json');
+const primeraVez = !cambiosPrevios;
+const registro = cambiosPrevios?.cambios ?? [];
+const nuevos = [];
 const resultado = { categorias: new Map(), equipos: [] };
 const errores = [];
+let clasificacionesPedidas = 0;
+const firma = jornadas => JSON.stringify(jornadas.map(j => j.partidos.map(p => [p.localNombre, p.visitanteNombre, p.puntosLocal, p.puntosVisitante, p.estado])));
 
-for (const codigo of config.grupos) {
+for (const g of lista) {
+  const codigo = g.codigo;
   try {
-    console.log(`Grupo ${codigo}...`);
     const cal = leerCalendario(await obtener(URL_CAL(codigo), `calendario-${codigo}.html`), codigo);
-    const cla = leerClasificacion(await obtener(URL_CLA(codigo), `clasificaciones-${codigo}.html`), codigo);
 
     const sem = infoGrupoSemilla[codigo];
-    const cat = sem?.categoria ?? { id: hashId(`cat|${cal.nombre}`, 1000), codigo: codigo.slice(0, 2), genero: '', nombre: cal.nombre, grupos: [] };
+    const nombreCat = g.categoria || sem?.categoria?.nombre || cal.nombre;
+    const cat = sem?.categoria ?? catSemillaPorNombre[norm(nombreCat)] ??
+      { id: hashId(`cat|${norm(nombreCat)}`, 1000), codigo: codigo.slice(0, 2), genero: generoDe(nombreCat), nombre: nombreCat };
     const grupo = { id: sem?.id ?? hashId(`gr|${codigo}`, 1000), codigo, nombre: sem?.nombre ?? cal.nombre,
                     tipo: sem?.tipo ?? (/COPA/i.test(cal.nombre) ? 'COPA' : 'LIGA') };
     if (!resultado.categorias.has(cat.id)) resultado.categorias.set(cat.id, { id: cat.id, codigo: cat.codigo, genero: cat.genero, nombre: cat.nombre, grupos: [] });
@@ -156,11 +192,37 @@ for (const codigo of config.grupos) {
         };
       }),
     }));
-    const clasificacion = cla.filter(r => !esDescanso(r.equipo)).map(r => ({
-      posicion: r.posicion, equipoId: idEquipo(codigo, r.equipo), equipoNombre: r.equipo,
-      partidosJugados: r.J, partidosGanados: r.G, partidosPerdidos: r.P,
-      puntosFavor: r.TF, puntosContra: r.TC, diferenciaPuntos: r.TF - r.TC, puntos: r.puntos,
-    }));
+
+    // 2) Comparar con lo publicado: resultados nuevos y si hace falta pedir la clasificación
+    const partidosAntes = await anterior(`grupos/${codigo}/partidos.json`);
+    const claAntes = partidosAntes ? await anterior(`grupos/${codigo}/clasificacion.json`) : null;
+    if (partidosAntes && !primeraVez) {
+      const antes = new Map(partidosAntes.flatMap(j => j.partidos).map(p => [p.id, p]));
+      for (const j of partidos) for (const p of j.partidos) {
+        const a = antes.get(p.id);
+        if (p.estado === 'JUGADO' && (!a || a.puntosLocal !== p.puntosLocal || a.puntosVisitante !== p.puntosVisitante)) {
+          nuevos.push({ detectado: ahora.toISOString(), grupo: codigo, jornada: j.numero, fechaJornada: j.fecha,
+                        partido: `${p.localNombre} ${p.puntosLocal}-${p.puntosVisitante} ${p.visitanteNombre}` });
+        }
+      }
+    }
+    let clasificacion;
+    if (claAntes && partidosAntes && firma(partidosAntes) === firma(partidos)) {
+      clasificacion = claAntes;  // sin novedades: se reutiliza
+    } else {
+      clasificacionesPedidas++;
+      try {
+        const cla = leerClasificacion(await obtener(URL_CLA(codigo), `clasificaciones-${codigo}.html`), codigo);
+        clasificacion = cla.filter(r => !esDescanso(r.equipo)).map(r => ({
+          posicion: r.posicion, equipoId: idEquipo(codigo, r.equipo), equipoNombre: r.equipo,
+          partidosJugados: r.J, partidosGanados: r.G, partidosPerdidos: r.P,
+          puntosFavor: r.TF, puntosContra: r.TC, diferenciaPuntos: r.TF - r.TC, puntos: r.puntos,
+        }));
+      } catch (e) {
+        clasificacion = claAntes ?? [];
+        errores.push(`${codigo} (clasificación): ${e.message}`);
+      }
+    }
 
     await escribir(`grupos/${codigo}/partidos.json`, partidos);
     await escribir(`grupos/${codigo}/clasificacion.json`, clasificacion);
@@ -168,27 +230,33 @@ for (const codigo of config.grupos) {
       resultado.equipos.push({ equipoId: idEquipo(codigo, e.nombre), equipoNombre: e.nombre, clubNombre: e.club,
         categoriaId: cat.id, categoriaNombre: cat.nombre, grupoId: grupo.id, grupoCodigo: codigo, grupoNombre: grupo.nombre });
     }
-    console.log(`  ${cal.equipos.length} equipos, ${partidos.length} jornadas, ${clasificacion.length} en clasificación`);
+    console.log(`${codigo}: ${cal.equipos.length} equipos, ${partidos.length} jornadas, ${clasificacion.length} en clasificación`);
   } catch (e) {
-    console.error(`  ERROR: ${e.message}`);
+    console.error(`${codigo}: ERROR ${e.message}`);
     errores.push(`${codigo}: ${e.message}`);
   }
 }
 
-if (errores.length === config.grupos.length) {
+if (errores.length >= lista.length) {
   console.error('\nNingún grupo se ha podido leer. No se publica nada (se mantiene la versión anterior).');
   process.exit(1);
 }
 
 const categorias = [...resultado.categorias.values()].sort((a, b) => a.codigo.localeCompare(b.codigo));
+for (const c of categorias) c.grupos.sort((a, b) => a.codigo.localeCompare(b.codigo));
 await escribir('temporadas/actual.json', temporada);
 await escribir('categorias.json', categorias);
 for (const c of categorias) {
   await escribir(`categorias/${c.id}/grupos.json`, c.grupos.map(g => ({ ...g, categoriaId: c.id, categoriaNombre: c.nombre })));
 }
 await escribir('equipos.json', { equipos: resultado.equipos });
-await escribir('estado.json', { actualizado: ahora.toISOString(), grupos: config.grupos, errores });
-console.log(`\nListo en ${SALIDA}${errores.length ? ` (con ${errores.length} errores)` : ''}`);
+// Registro de cuándo aparece cada resultado nuevo (para conocer el ritmo de la federación)
+const ejecuciones = [...(cambiosPrevios?.ejecuciones ?? []), { fecha: ahora.toISOString(), resultadosNuevos: nuevos.length, clasificacionesPedidas }].slice(-200);
+await escribir('cambios.json', { cambios: [...registro, ...nuevos].slice(-2000), ejecuciones });
+await escribir('estado.json', { actualizado: ahora.toISOString(), grupos: lista.length, clasificacionesPedidas, resultadosNuevos: nuevos.length, errores });
+console.log(`\nListo: ${lista.length} grupos, ${clasificacionesPedidas} clasificaciones consultadas, ${nuevos.length} resultados nuevos${primeraVez ? ' (primera ejecución: sin comparar)' : ''}, ${errores.length} errores.`);
+if (nuevos.length) console.log(`::notice::${nuevos.length} resultados nuevos en: ${[...new Set(nuevos.map(n => n.grupo))].join(', ')}`);
+else console.log('::notice::Sin resultados nuevos');
 // Un grupo fallido no bloquea la publicación del resto; se avisa en GitHub Actions.
 for (const e of errores) console.log(`::warning::${e}`);
 
